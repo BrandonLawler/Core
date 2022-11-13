@@ -10,11 +10,13 @@ from .courier import Courier
 
 
 def _process_wrapper(process_id, _courier, *args, **kwargs):
-    received = _courier.receive(wait=True)
-    if received.subject != 'process':
-        _courier.error("Process {} received unexpected message: {}".format(process_id, received))
-        _courier.shutdown()
-        return
+    waitingProcess = True
+    while waitingProcess:
+        received = _courier.receive(wait=True)
+        if received.subject != 'process':
+            _courier.receiveQueue.put(received)
+        else:
+            waitingProcess = False
     process_function = received.message
     _courier.info(f"Starting Process - {process_id}")
     try:
@@ -59,30 +61,40 @@ class Core:
                 for key, value in ejd.items():
                     os.environ[str(key)] = str(value)
         
-    def create_process(self, process_id, process_function, process_args=None, process_kwargs=None, force_terminate=False):
+    def create_process(self, process_id, process_function, process_args=None, process_kwargs=None, force_terminate=False, worker_count=1):
         if process_args is None:
             process_args = []
         if process_kwargs is None:
             process_kwargs = {}
-        shutdown = multiprocessing.Event()
-        self._process_count += 1
-        courier = Courier(process_id, self._process_event, shutdown, self._log.log_queue)
-        self.update_couriers(process_id, courier.receiveQueue)
-        courier.add_send_queue(self._courier.id, self._courier.receiveQueue)
-        for id, processData in self._processes.items():
-            courier.add_send_queue(id, processData["courier"].receiveQueue)
-        process_args.insert(0, courier)
-        process_args.insert(0, process_id)
-        process = multiprocessing.Process(target=_process_wrapper, args=process_args, kwargs=process_kwargs)
-        self._processes[process_id] = {
-            "process": process,
-            "shutdown": shutdown,
-            "courier": courier,
-            "pid": None,
-            "isShutdown": False,
-            "forceTerminate": force_terminate,
-            'function': process_function
-        }
+        receive_queue = None
+        for i in range(worker_count):
+            self._process_count += 1
+            shutdown = multiprocessing.Event()
+            courier = Courier(process_id, self._process_event, shutdown, self._log.log_queue, receive_queue)
+            if receive_queue is None:
+                receive_queue = courier.receiveQueue
+                self.update_couriers(process_id, courier.receiveQueue)
+            courier.add_send_queue(self._courier.id, self._courier.receiveQueue)
+            for processData in self._processes.values():
+                courier.add_send_queue(processData["receiver_id"], processData["courier"].receiveQueue)
+            nprocess_id = process_id
+            if worker_count > 1:
+                nprocess_id = f"{process_id}_{i}"
+                courier.set_identifier(nprocess_id)
+            process_args.insert(0, courier)
+            process_args.insert(0, nprocess_id)
+            process = multiprocessing.Process(target=_process_wrapper, args=process_args, kwargs=process_kwargs)
+            self._processes[nprocess_id] = {
+                "process": process,
+                "shutdown": shutdown,
+                "courier": courier,
+                "pid": None,
+                "isShutdown": False,
+                "forceTerminate": force_terminate,
+                'function': process_function,
+                'bulk': False if worker_count == 1 else True,
+                'receiver_id': process_id
+            }
 
     def update_couriers(self, newCourierId: str, newCourierQueue: multiprocessing.Queue):
         for processData in self._processes.values():
@@ -104,7 +116,7 @@ class Core:
                 processData["process"].terminate()
     
     def send(self, receiver: str, subject:str, message=None):
-        self._courier.send(receiver, message, subject)
+        self._courier.send(receiver, subject, message)
     
     def watcher(self):
         while not self._process_event.is_set():
@@ -118,15 +130,16 @@ class Core:
                 pass
         self._log.log_queue.put(LogMessage("Core", "Watcher Shutdown Complete", Log._INFO))
         force_shutdowns = [i["courier"].id for i in self._processes.values() if i["forceTerminate"]]
-        self._log.log_queue.put(LogMessage("Core", f"{force_shutdowns} Process Required to be Force Terminated - Shutting down Quietly", Log._INFO))
+        if len(force_shutdowns) > 0:
+            self._log.log_queue.put(LogMessage("Core", f"{force_shutdowns} Process Required to be Force Terminated - Shutting down Quietly", Log._INFO))
         self._log_process_event.set()
     
     def start(self):
         self._watcher_process.start()
         for processData in self._processes.values():
             processData["process"].start()
-            self.send(processData["courier"].id, subject='process', message=processData['function'])
-        self._log.start()
+            self.send(processData["receiver_id"], subject='process', message=processData['function'])
+        self._log.start() # Blocking Function, Exits on Shutdown Event
         while self._process_count != 0:
             try:
                 self._check_shutdowns(True)
