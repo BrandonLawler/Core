@@ -1,9 +1,9 @@
-from concurrent.futures import process
 import multiprocessing
 import logging
 import json
 import os
 import signal
+from dotenv import load_dotenv
 
 from .log import Log, LogMessage
 from .courier import Courier
@@ -27,12 +27,12 @@ def _process_wrapper(process_id, _courier, *args, **kwargs):
 
 
 class Core:
-    def __init__(self, log_level=logging.INFO, log_folder=None, log_file=None, log_environment=None, environment_json=None):
+    def __init__(self, log_level=logging.INFO, log_folder=None, log_file=None, log_environment=None, environment_file=None):
         self.log_level = log_level
         self.log_folder = log_folder
         self.log_file = log_file
         self.log_environment = log_environment
-        self.environment_json = environment_json
+        self.environment_file = environment_file
         self._log_process_event = multiprocessing.Event()            
 
         self._process_event = multiprocessing.Event()
@@ -47,19 +47,24 @@ class Core:
         self._log = Log(self._log_process_event, self.log_level, self.log_folder, self.log_file, self.log_environment)
         self._watcher_process = multiprocessing.Process(target=self.watcher)
 
-        if self.log_environment is not None and self.environment_json is None:
-            self._courier.log(logging.WARNING, "Environment Json not Given - Use of Environment Will be Attempted")
+        if self.log_environment is not None and self.environment_file is None:
+            self._courier.log(logging.WARNING, "Environment File not Given - Use of Environment Will be Attempted")
         
     def _cancel_handler(self, signum, frame):
         self._process_event.set()
         self._log.log_queue.put(LogMessage("Core", f"Interrupt Received", Log._INFO))
     
     def _setup_environment(self):
-        if self.environment_json is not None:
-            with open(self.environment_json, "r") as ej:
-                ejd = json.load(ej)
-                for key, value in ejd.items():
-                    os.environ[str(key)] = str(value)
+        if self.environment_file is not None:
+            if ".json" in self.environment_file:
+                with open(self.environment_file, "r") as ej:
+                    ejd = json.load(ej)
+                    for key, value in ejd.items():
+                        os.environ[str(key)] = str(value)
+            elif ".env" in self.enviornment_file:
+                load_dotenv(self.environment_file)
+            else:
+                self._courier.log(logging.ERROR, "Environment File Supplied Unknown Format - Environment File can either be .env or .json")
         
     def create_process(self, process_id, process_function, process_args=None, process_kwargs=None, force_terminate=False, worker_count=1):
         if process_args is None:
